@@ -1,15 +1,15 @@
-import requests
+ import requests
 import time
 import logging
 from datetime import datetime
 from telegram import Bot
+import pandas as pd
 
 # Настройки
 TOKEN = '7725173875:AAGe-yLJxNGF3uuBOKVi_OjHsP6dJi2KZPU'
 CHAT_ID = '5975002685'
 bot = Bot(token=TOKEN)
 
-# Криптовалути и CoinGecko ID-та
 COINS = {
     'SHIB': 'shiba-inu',
     'SNEK': 'snek',
@@ -19,47 +19,40 @@ COINS = {
     'ADA': 'cardano',
 }
 
-# Стара цена за сравнение
-last_prices = {}
+INTERVAL = 180  # 3 минути
 
-# Интервал за проверка (в секунди)
-CHECK_INTERVAL = 180  # 3 минути
-
-def get_price(coin_id):
-    url = f'https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd'
+def get_ohlc(coin_id):
+    url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1&interval=hourly'
     try:
-        response = requests.get(url)
-        return response.json()[coin_id]['usd']
+        res = requests.get(url).json()
+        prices = res['prices'][-30:]  # последните 30 часа
+        df = pd.DataFrame(prices, columns=['timestamp', 'price'])
+        df['price'] = df['price'].astype(float)
+        return df
     except Exception as e:
-        logging.error(f"Грешка при вземане на цена: {e}")
+        logging.error(f"Грешка при ohlc: {e}")
         return None
 
-def send_signal(symbol, price, signal_type):
-    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-    message = f"📈 [{now} UTC] {signal_type} сигнал за {symbol}\\n💰 Цена: ${price:.8f}"
-    bot.send_message(chat_id=CHAT_ID, text=message)
+def calculate_indicators(df):
+    df['EMA9'] = df['price'].ewm(span=9, adjust=False).mean()
+    df['EMA21'] = df['price'].ewm(span=21, adjust=False).mean()
+    delta = df['price'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    return df
 
-def main_loop():
-    while True:
-        for symbol, coin_id in COINS.items():
-            price = get_price(coin_id)
-            if price is None:
-                continue
+def analyze(df):
+    if df is None or len(df) < 21:
+        return None
 
-            if symbol not in last_prices:
-                last_prices[symbol] = price
-                continue
+    last = df.iloc[-1]
+    ema9 = last['EMA9']
+    ema21 = last['EMA21']
+    rsi = last['RSI']
 
-            last_price = last_prices[symbol]
-            change = (price - last_price) / last_price
-
-            if change >= 0.02:
-                send_signal(symbol, price, "🟢 Вход")
-            elif change <= -0.02:
-                send_signal(symbol, price, "🔴 Изход")
-
-            last_prices[symbol] = price
-        time.sleep(CHECK_INTERVAL)
-
-if __name__ == '__main__':
-    main_loop()
+    if rsi < 30 and ema9 > ema21:
+        return "🟢 Вход (RSI < 30 и EMA9 > EMA21)"
+    elif rsi > 70 or ema9 < ema21:
+        return "🔴 Изход (RSI >
