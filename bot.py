@@ -55,4 +55,4 @@ def analyze(df):
     if rsi < 30 and ema9 > ema21:
         return "🟢 Вход (RSI < 30 и EMA9 > EMA21)"
     elif rsi > 70 or ema9 < ema21:
-        return "🔴 Изход (RSI >
+        return "🔴 Изход (RSI > 70)"
