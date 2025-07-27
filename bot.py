@@ -1,82 +1,66 @@
-import requests
 import time
-import logging
-from datetime import datetime
+import requests
+from collections import deque
 from telegram import Bot
-import pandas as pd
 
-# Настройки
-TOKEN = '7725173875:AAGe-yLJxNGF3uuBOKVi_OjHsP6dJi2KZPU'
+# 🔐 Реални данни
+TOKEN = '8375149420:AAEp6fFoDpfEyd8VGwK5a7YUAG2hbqfKqBY'
 CHAT_ID = '5975002685'
+
 bot = Bot(token=TOKEN)
 
-COINS = {
-    'SHIB': 'shiba-inu',
-    'SNEK': 'snek',
-    'TREAT': 'treat-token',
-    'LEASH': 'doge-killer',
-    'BONE': 'bone-shibaswap',
-    'ADA': 'cardano',
+# Криптовалути за следене
+tracked_symbols = ["SHIB", "SNEK", "TREAT", "LEASH", "BONE", "ADA"]
+
+# История на последните 5 цени (1 запис/минута)
+price_history = {symbol: deque(maxlen=5) for symbol in tracked_symbols}
+
+# Преобразуване към CoinGecko ID
+symbol_map = {
+    "SHIB": "shiba-inu",
+    "SNEK": "snek",
+    "TREAT": "treat",
+    "LEASH": "doge-killer",
+    "BONE": "bone-shibaswap",
+    "ADA": "cardano"
 }
 
-INTERVAL = 180  # Проверка на всеки 3 минути
-
-def get_ohlc(coin_id):
-    url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1&interval=hourly'
+# Вземане на текуща цена
+def get_price(symbol):
     try:
-        res = requests.get(url).json()
-        prices = res.get('prices', [])[-30:]  # последните 30 часа
-        if not prices:
-            return None
-        df = pd.DataFrame(prices, columns=['timestamp', 'price'])
-        df['price'] = df['price'].astype(float)
-        return df
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={symbol_map[symbol]}&vs_currencies=usd"
+        response = requests.get(url)
+        data = response.json()
+        return float(data[symbol_map[symbol]]['usd'])
     except Exception as e:
-        logging.error(f"Грешка при ohlc: {e}")
+        print(f"❌ Грешка при вземане на цена за {symbol}: {e}")
         return None
 
-def calculate_indicators(df):
-    df['EMA9'] = df['price'].ewm(span=9, adjust=False).mean()
-    df['EMA21'] = df['price'].ewm(span=21, adjust=False).mean()
-    delta = df['price'].diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = -delta.where(delta < 0, 0).rolling(14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    return df
+# Проверка за скок ≥5% за 5 минути
+def check_price_spike(symbol, current_price):
+    history = price_history[symbol]
+    if len(history) == 5:
+        old_price = history[0]
+        percent_change = ((current_price - old_price) / old_price) * 100
+        if percent_change >= 5:
+            return True, percent_change
+    history.append(current_price)
+    return False, 0
 
-def analyze(df):
-    if df is None or len(df) < 21:
-        return None
+# Главен цикъл
+def run_bot():
+    while True:
+        for symbol in tracked_symbols:
+            current_price = get_price(symbol)
+            if current_price is None:
+                continue
 
-    last = df.iloc[-1]
-    ema9 = last['EMA9']
-    ema21 = last['EMA21']
-    rsi = last['RSI']
+            spike, percent = check_price_spike(symbol, current_price)
+            if spike:
+                message = f"🚀 {symbol}: Цената се покачи с {percent:.2f}% за последните 5 минути!"
+                bot.send_message(chat_id=CHAT_ID, text=message)
 
-    if rsi < 30 and ema9 > ema21:
-        return "🟢 Вход (RSI < 30 и EMA9 > EMA21)"
-    elif rsi > 70 or ema9 < ema21:
-        return "🔴 Изход (RSI > 70 или EMA9 < EMA21)"
-    else:
-        return None
+        time.sleep(60)
 
-# Памет за последен изпратен сигнал
-last_signals = {}
-
-while True:
-    for symbol, coin_id in COINS.items():
-        try:
-            df = get_ohlc(coin_id)
-            if df is not None:
-                df = calculate_indicators(df)
-                signal = analyze(df)
-
-                if signal and last_signals.get(symbol) != signal:
-                    message = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{symbol}: {signal}"
-                    bot.send_message(chat_id=CHAT_ID, text=message)
-                    last_signals[symbol] = signal
-                    print(f"[{symbol}] Изпратен сигнал: {signal}")
-        except Exception as e:
-            logging.error(f"Грешка при обработка на {symbol}: {e}")
-    time.sleep(INTERVAL)
+if __name__ == "__main__":
+    run_bot()
