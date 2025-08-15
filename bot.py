@@ -1,10 +1,9 @@
-# bot.py — САМО сигнали за РЪСТ (≤5 мин) + важни новини (🟢/🔴)
-# Работи с Binance + CoinGecko (LEASH, BONE, TREAT, SNEK). Без JobQueue.
+# bot.py — САМО сигнали за РЪСТ (≤5 мин) + важни новини (🟢/🔴) със строг филтър
+# Библиотеки: python-telegram-bot==21.4, requests, feedparser
 
 import os, time, asyncio, re, sqlite3
 from collections import deque, defaultdict
-import requests
-import feedparser
+import requests, feedparser
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -23,7 +22,8 @@ ENABLE_RISE_ALERTS = os.getenv("ENABLE_RISE_ALERTS", "1") == "1"
 NEWS_POLL_INTERVAL   = max(int(os.getenv("NEWS_POLL_INTERVAL", "90")), 30)
 NEWS_ENABLED_DEFAULT = os.getenv("NEWS_ENABLED", "1") == "1"
 
-FEEDS_DEFAULT = [
+# ── Новинарски източници ─────────────────────────────────────────────────────
+FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
     "https://www.binance.com/en/blog/rss",
@@ -31,41 +31,51 @@ FEEDS_DEFAULT = [
     "https://www.federalreserve.gov/feeds/press_all.xml",
 ]
 
-POSITIVE = [
-    "approve","approval","approved","etf","listing","list","launch",
-    "integration","support","partnership","acquire","acquisition",
-    "record","ath","all-time high","buyback","custody","spot etf",
-    "rate cut","cut rates","lower rates","reduce rates",
-]
-NEGATIVE = [
-    "hack","exploit","breach","attack","outage","halt","ban",
-    "lawsuit","sue","fraud","delay","postpone","suspension","freeze",
-    "selloff","liquidation","liquidations","downtime","bankrupt",
-    "insolvent","probe","investigation"
-]
-NEWS_KEYWORDS = [w.strip().lower() for w in os.getenv("NEWS_KEYWORDS","").split(",") if w.strip()] or \
-    ["btc","bitcoin","eth","ethereum","sol","solana","sec","federal reserve","fed","inflation",
-     "cpi","ppi","rate","rates","etf","listing","approval","hack","exploit","lawsuit","ban","delay","halt",
-     "binance","coinbase","grayscale","blackrock","withdrawals","deposits","liquidation","liquidations"]
-
-DEFAULT_CG_IDS = {
-    "LEASH": "doge-killer",
-    "BONE":  "bone-shibaswap",
-    "SNEK":  "snek",
-    "TREAT": "treat",
+# само тези домейни се допускат
+ALLOWED_SOURCES = {
+    "coindesk.com","www.coindesk.com",
+    "cointelegraph.com",
+    "www.binance.com",
+    "sec.gov","www.sec.gov",
+    "federalreserve.gov","www.federalreserve.gov",
 }
+
+# скучни термини (режем ги)
+BORING_TERMS = [
+    "roundtable","webinar","faq","faqs","statistics","visualization",
+    "data visualizations","staff statement","proposal for comment",
+    "appoints","hiring","workshop","website","new webpage",
+    "educational","outreach","request for comment","round table"
+]
+
+# силни тригери
+STRONG_POS = [
+    "approve","approved","approval","etf","spot etf","listing","lists","relist",
+    "launch","support","integration","backed","partnership",
+    "rate cut","cuts rates","lower rates",
+]
+STRONG_NEG = [
+    "hack","exploit","breach","attack","outage","halt","suspend","suspends",
+    "ban","delist","delists","lawsuit","sues","charges","complaint","settlement",
+    "freeze","withdrawals halted","depeg","depegs","insolvent","bankrupt",
+    "delay","postpone","reject","denies","investigation","probe","seize",
+    "liquidation","liquidations","selloff"
+]
+
+MACRO  = ["cpi","ppi","inflation","fed","federal reserve","rate decision","interest rate"]
+MAJORS = ["btc","bitcoin","eth","ethereum","sol","xrp","bnb",
+          "usdt","usdc","binance","coinbase","grayscale","blackrock"]
 
 # ── Състояние ────────────────────────────────────────────────────────────────
 WINDOW_SECONDS = 5 * 60  # ≤5 мин
-price_window: dict[str, deque] = {sym: deque() for sym in SYMBOLS}
+price_window: dict[str, deque] = { }  # създаваме при първата цена
 last_alert_up: dict[str, float] = defaultdict(lambda: 0.0)
 current_rise_pct: float = DEFAULT_RISE_PCT
 
 DB_PATH = "news_store.sqlite"
 
-# ── DB ────────────────────────────────────────────────────────────────────────
-def db():
-    return sqlite3.connect(DB_PATH)
+# ── Лека локална БД ───────────────────────────────────────────────────────────
+def db(): return sqlite3.connect(DB_PATH)
 
 def init_db():
     con = db(); cur = con.cursor()
@@ -105,6 +115,7 @@ def is_seen(feed: str, uid: str) -> bool:
 # ── Помощници ────────────────────────────────────────────────────────────────
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
 COINGECKO_SIMPLE_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+DEFAULT_CG_IDS = {"LEASH":"doge-killer","BONE":"bone-shibaswap","SNEK":"snek","TREAT":"treat"}
 
 def pct_change(a: float, b: float) -> float:
     if a == 0: return 0.0
@@ -114,7 +125,7 @@ def is_binance_symbol(sym: str) -> bool:
     return sym.endswith(("USDT","USDC","BUSD"))
 
 def coingecko_id_for(sym: str) -> str | None:
-    return DEFAULT_CG_IDS.get(sym.upper())
+    return DEFAULT_CG_IDS.get(sym)
 
 def fetch_price_binance(symbol: str) -> float | None:
     try:
@@ -137,13 +148,11 @@ def fetch_price_coingecko_by_id(cg_id: str) -> float | None:
 def fetch_price(symbol: str) -> float | None:
     if is_binance_symbol(symbol):
         p = fetch_price_binance(symbol)
-        if p is not None:
-            return p
+        if p is not None: return p
         cg = coingecko_id_for(symbol)
         return fetch_price_coingecko_by_id(cg) if cg else None
-    else:
-        cg = coingecko_id_for(symbol)
-        return fetch_price_coingecko_by_id(cg) if cg else None
+    cg = coingecko_id_for(symbol)
+    return fetch_price_coingecko_by_id(cg) if cg else None
 
 def host_from_link(link: str) -> str:
     try:
@@ -151,14 +160,28 @@ def host_from_link(link: str) -> str:
     except Exception:
         return "source"
 
-def classify_news(title: str, summary: str) -> str | None:
-    text = f"{title} {summary}".lower()
-    if not any(k in text for k in NEWS_KEYWORDS):
+def _contains_any(text: str, words: list[str]) -> bool:
+    return any(w in text for w in words)
+
+def classify_news_strict(title: str, summary: str, link: str) -> str | None:
+    host = host_from_link(link)
+    if host not in ALLOWED_SOURCES:
         return None
-    pos = sum(k in text for k in POSITIVE)
-    neg = sum(k in text for k in NEGATIVE)
-    if neg > pos and neg > 0: return "🔴"
-    if pos > neg and pos > 0: return "🟢"
+
+    text = f"{title} {summary}".lower()
+
+    # режем бюрократични/информационни постове
+    if _contains_any(text, BORING_TERMS):
+        return None
+
+    # макро или големи актьори
+    strong_context = _contains_any(text, MAJORS) or _contains_any(text, MACRO)
+
+    pos = _contains_any(text, STRONG_POS)
+    neg = _contains_any(text, STRONG_NEG)
+
+    if neg and strong_context: return "🔴"
+    if pos and strong_context: return "🟢"
     return None
 
 # ── Фонови цикли (без JobQueue) ──────────────────────────────────────────────
@@ -167,7 +190,7 @@ async def prices_loop(app: Application):
     await asyncio.sleep(2)
     while True:
         t0 = time.time()
-        for sym in list(SYMBOLS):
+        for sym in SYMBOLS:
             price = fetch_price(sym)
             if price is None:
                 continue
@@ -175,51 +198,54 @@ async def prices_loop(app: Application):
             dq.append((t0, price))
             while dq and (t0 - dq[0][0] > WINDOW_SECONDS):
                 dq.popleft()
+
             if not dq or not ENABLE_RISE_ALERTS:
                 continue
+
             min_p = min(p for _, p in dq)
             rise = pct_change(min_p, price)
-            if rise >= abs(current_rise_pct):
-                if t0 - last_alert_up[sym] >= cooldown:
-                    last_alert_up[sym] = t0
-                    msg = (f"🔺 {sym}: {rise:.2f}% ръст ≤5 мин\n"
-                           f"От ~{min_p:.10g} до {price:.10g}")
-                    try:
-                        await app.bot.send_message(CHAT_ID, msg)
-                    except Exception:
-                        pass
+            if rise >= abs(current_rise_pct) and t0 - last_alert_up[sym] >= cooldown:
+                last_alert_up[sym] = t0
+                msg = (f"🔺 {sym}: {rise:.2f}% ръст ≤5 мин\n"
+                       f"От ~{min_p:.10g} до {price:.10g}")
+                try:
+                    await app.bot.send_message(CHAT_ID, msg)
+                except Exception:
+                    pass
+
         elapsed = time.time() - t0
         await asyncio.sleep(max(1, PRICE_POLL_SECONDS - int(elapsed)))
 
 async def news_loop(app: Application):
-    # анти-спам при старт: маркирай най-новата статия от всеки фийд
-    for feed in FEEDS_DEFAULT:
+    # анти-спам при старт: маркирай последната статия от всеки фийд
+    for feed in FEEDS:
         try:
             d = feedparser.parse(feed)
             if d.entries:
                 e0 = d.entries[0]
-                uid = getattr(e0, "id", "") or getattr(e0, "guid", "") or getattr(e0, "link", "") or getattr(e0, "title", "")
-                if uid:
-                    mark_seen(feed, uid)
+                uid = getattr(e0,"id","") or getattr(e0,"guid","") or getattr(e0,"link","") or getattr(e0,"title","")
+                if uid: mark_seen(feed, uid)
         except Exception:
             pass
+
     await asyncio.sleep(NEWS_POLL_INTERVAL)
+
     while True:
         try:
             if get_pref("news_enabled","1") == "1":
-                for feed in FEEDS_DEFAULT:
+                for feed in FEEDS:
                     try:
                         d = feedparser.parse(feed)
                     except Exception:
                         continue
                     for e in reversed(d.entries[:10]):
-                        uid = getattr(e, "id", "") or getattr(e, "guid", "") or getattr(e, "link", "") or getattr(e, "title", "")
+                        uid = getattr(e,"id","") or getattr(e,"guid","") or getattr(e,"link","") or getattr(e,"title","")
                         if not uid or is_seen(feed, uid):
                             continue
-                        title = getattr(e, "title", "")
-                        summary = getattr(e, "summary", "")
-                        link = getattr(e, "link", "")
-                        tag = classify_news(title, summary)
+                        title = getattr(e,"title","")
+                        summary = getattr(e,"summary","")
+                        link = getattr(e,"link","")
+                        tag = classify_news_strict(title, summary, link)
                         if tag:
                             msg = f"{tag} <b>{title}</b>\n🔗 <a href=\"{link}\">{host_from_link(link)}</a>"
                             try:
@@ -231,14 +257,15 @@ async def news_loop(app: Application):
             break
         except Exception:
             pass
+
         await asyncio.sleep(NEWS_POLL_INTERVAL)
 
 # ── Команди ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message(
         "✅ Ботът е активен.\n"
-        "• Сигнали: САМО за РЪСТ (≤5 мин) – праг се сменя с /set_rise.\n"
-        "• Новини: 🟢/🔴 от CoinDesk, Cointelegraph, Binance, SEC, ФЕД.\n\n"
+        "• Сигнали: САМО за РЪСТ (≤5 мин). Праг се сменя с /set_rise.\n"
+        "• Новини: само силни 🟢/🔴 събития (ETF, листинги/делистинги, хакове, спирания, CPI/FED).\n\n"
         "Команди:\n"
         "/status – статус и символи\n"
         "/set_rise 5 – смяна на прага (%)\n"
@@ -261,7 +288,7 @@ async def cmd_set_rise(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global current_rise_pct
     try:
         val = float(ctx.args[0])
-        if val <= 0 or val > 100:
+        if not (0.1 <= val <= 100):
             raise ValueError
         current_rise_pct = val
         await update.effective_chat.send_message(f"✅ Прагът за ръст е {current_rise_pct:.2f}% (≤5 мин).")
