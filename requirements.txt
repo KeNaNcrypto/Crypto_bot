@@ -1,4 +1,4 @@
 requests
 pandas
-python-telegram-bot==13.11
+python-telegram-bot==21.4
 feedparser
