@@ -1,352 +1,335 @@
-# bot.py — САМО сигнали за РЪСТ (≤5 мин) + важни новини (🟢/🔴) със строг филтър
-# Библиотеки: python-telegram-bot==21.4, requests, feedparser
+# REQUIREMENTS (в requirements.txt):
+# pyTelegramBotAPI==4.17.0
+# requests==2.32.3
+# feedparser==6.0.11
 
-import os, time, asyncio, re, sqlite3
+import os, time, math, threading, logging
+from datetime import datetime, timedelta, timezone
 from collections import deque, defaultdict
-import requests, feedparser
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ── ENV ───────────────────────────────────────────────────────────────────────
-TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
+import requests
+import feedparser
+import telebot
 
-DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,ADAUSDT,LEASH,BONE,TREAT,SNEK"
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
+# -----------------------------
+# 1) ENV от Render (Settings → Environment)
+# -----------------------------
+BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
+OWNER_CHAT_ID  = int(os.getenv("OWNER_CHAT_ID", "0"))
 
-PRICE_POLL_SECONDS = max(int(os.getenv("PRICE_POLL_SECONDS", "30")), 10)
-COOLDOWN_MINUTES   = max(int(os.getenv("COOLDOWN_MINUTES", "10")), 1)
-DEFAULT_RISE_PCT   = float(os.getenv("RISE_PCT", "5"))  # по подразбиране 5%
-ENABLE_RISE_ALERTS = os.getenv("ENABLE_RISE_ALERTS", "1") == "1"
-
-NEWS_POLL_INTERVAL   = max(int(os.getenv("NEWS_POLL_INTERVAL", "90")), 30)
-NEWS_ENABLED_DEFAULT = os.getenv("NEWS_ENABLED", "1") == "1"
-
-# ── Новинарски източници ─────────────────────────────────────────────────────
-FEEDS = [
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://cointelegraph.com/rss",
-    "https://www.binance.com/en/blog/rss",
-    "https://www.sec.gov/news/pressreleases.rss",
-    "https://www.federalreserve.gov/feeds/press_all.xml",
-]
-
-# само тези домейни се допускат
-ALLOWED_SOURCES = {
-    "coindesk.com","www.coindesk.com",
-    "cointelegraph.com",
-    "www.binance.com",
-    "sec.gov","www.sec.gov",
-    "federalreserve.gov","www.federalreserve.gov",
+# Монети за следене (Coingecko ids)
+COINS = {
+    "SHIB":  "shiba-inu",
+    "LEASH": "doge-killer",
+    "BONE":  "bone-shibaswap",
+    "ADA":   "cardano",
+    "SNEK":  "snek",  # ако го няма в Coingecko, просто ще се пропуска
+    # "TREAT": "treat",  # добави ако има точен id в Coingecko
 }
 
-# скучни термини (режем ги)
-BORING_TERMS = [
-    "roundtable","webinar","faq","faqs","statistics","visualization",
-    "data visualizations","staff statement","proposal for comment",
-    "appoints","hiring","workshop","website","new webpage",
-    "educational","outreach","request for comment","round table"
-]
+# Праг за 5-мин сигнал ±X%
+PCT_5M_THRESHOLD = float(os.getenv("PCT_5M", "5"))
 
-# силни тригери
-STRONG_POS = [
-    "approve","approved","approval","etf","spot etf","listing","lists","relist",
-    "launch","support","integration","backed","partnership",
-    "rate cut","cuts rates","lower rates",
-]
-STRONG_NEG = [
-    "hack","exploit","breach","attack","outage","halt","suspend","suspends",
-    "ban","delist","delists","lawsuit","sues","charges","complaint","settlement",
-    "freeze","withdrawals halted","depeg","depegs","insolvent","bankrupt",
-    "delay","postpone","reject","denies","investigation","probe","seize",
-    "liquidation","liquidations","selloff"
-]
+# Интервали
+PRICE_POLL_SEC   = int(os.getenv("PRICE_POLL_SEC", "60"))   # проверка на 60 сек
+NEWS_POLL_SEC    = int(os.getenv("NEWS_POLL_SEC", "300"))   # новини на 5 мин
 
-MACRO  = ["cpi","ppi","inflation","fed","federal reserve","rate decision","interest rate"]
-MAJORS = ["btc","bitcoin","eth","ethereum","sol","xrp","bnb",
-          "usdt","usdc","binance","coinbase","grayscale","blackrock"]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
-# ── Състояние ────────────────────────────────────────────────────────────────
-WINDOW_SECONDS = 5 * 60  # ≤5 мин
-price_window: dict[str, deque] = { }  # създаваме при първата цена
-last_alert_up: dict[str, float] = defaultdict(lambda: 0.0)
-current_rise_pct: float = DEFAULT_RISE_PCT
+# -----------------------------
+# 2) Кеш за цени и анти-спам
+# -----------------------------
+price_history = {sym: deque(maxlen=15) for sym in COINS}  # ~15 мин история при 60 сек
+last_signal_at = defaultdict(lambda: datetime(1970,1,1, tzinfo=timezone.utc))
+MIN_SIG_GAP = timedelta(minutes=10)
 
-DB_PATH = "news_store.sqlite"
+# Новини: пазим последните заглавия за анти-дубликат
+sent_news = deque(maxlen=100)
 
-# ── Лека локална БД ───────────────────────────────────────────────────────────
-def db(): return sqlite3.connect(DB_PATH)
+# -----------------------------
+# 3) Помощни
+# -----------------------------
+def now_utc():
+    return datetime.now(timezone.utc)
 
-def init_db():
-    con = db(); cur = con.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS seen(
-        feed TEXT, uid TEXT, ts INTEGER, PRIMARY KEY(feed, uid)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS prefs(
-        k TEXT PRIMARY KEY, v TEXT
-    )""")
-    cur.execute("INSERT OR IGNORE INTO prefs(k,v) VALUES('news_enabled', ?)",
-                ("1" if NEWS_ENABLED_DEFAULT else "0",))
-    con.commit(); con.close()
-
-def get_pref(k: str, default: str = "") -> str:
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT v FROM prefs WHERE k=?", (k,))
-    row = cur.fetchone(); con.close()
-    return row[0] if row else default
-
-def set_pref(k: str, v: str):
-    con = db(); cur = con.cursor()
-    cur.execute("REPLACE INTO prefs(k,v) VALUES(?,?)", (k, v))
-    con.commit(); con.close()
-
-def mark_seen(feed: str, uid: str):
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO seen(feed,uid,ts) VALUES(?,?,?)",
-                (feed, uid, int(time.time())))
-    con.commit(); con.close()
-
-def is_seen(feed: str, uid: str) -> bool:
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT 1 FROM seen WHERE feed=? AND uid=?", (feed, uid))
-    ok = cur.fetchone() is not None
-    con.close(); return ok
-
-# ── Помощници ────────────────────────────────────────────────────────────────
-BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
-COINGECKO_SIMPLE_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
-DEFAULT_CG_IDS = {"LEASH":"doge-killer","BONE":"bone-shibaswap","SNEK":"snek","TREAT":"treat"}
-
-def pct_change(a: float, b: float) -> float:
-    if a == 0: return 0.0
-    return (b - a) / a * 100.0
-
-def is_binance_symbol(sym: str) -> bool:
-    return sym.endswith(("USDT","USDC","BUSD"))
-
-def coingecko_id_for(sym: str) -> str | None:
-    return DEFAULT_CG_IDS.get(sym)
-
-def fetch_price_binance(symbol: str) -> float | None:
+def send_denied(chat_id):
+    # кратко инфо за непознати чатове
     try:
-        r = requests.get(BINANCE_TICKER_URL, params={"symbol": symbol}, timeout=7)
-        r.raise_for_status()
-        return float(r.json()["price"])
+        bot.send_message(chat_id, "❌ Нямаш достъп до този бот.")
     except Exception:
-        return None
+        pass
 
-def fetch_price_coingecko_by_id(cg_id: str) -> float | None:
+def safe_send(chat_id, text):
+    if chat_id != OWNER_CHAT_ID:
+        logging.warning(f"Блокирано -> чужд chat_id={chat_id}")
+        return
     try:
-        r = requests.get(COINGECKO_SIMPLE_PRICE_URL, params={"ids": cg_id, "vs_currencies": "usd"}, timeout=7)
-        r.raise_for_status()
-        data = r.json()
-        val = data.get(cg_id, {}).get("usd")
-        return float(val) if val is not None else None
-    except Exception:
+        bot.send_message(chat_id, text)
+    except Exception as e:
+        logging.error(f"send_message error: {e}")
+
+def cg_simple_price(ids):
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": ",".join(ids), "vs_currencies": "usd"}
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def cg_market_chart(coin_id, days="1", interval="minute"):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {"vs_currency": "usd", "days": days, "interval": interval}
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json().get("prices", [])
+
+def ema(series, period):
+    if len(series) < period: return []
+    k = 2 / (period + 1)
+    out = []
+    sma = sum(series[:period]) / period
+    out.extend([None]*(period-1))
+    out.append(sma)
+    prev = sma
+    for p in series[period:]:
+        val = (p - prev) * k + prev
+        out.append(val)
+        prev = val
+    return out
+
+def rsi(series, period=14):
+    # стандартна RSI; връща списък със стойности и None за първите period елемента
+    if len(series) < period + 1: return []
+    gains, losses = [], []
+    for i in range(1, period+1):
+        ch = series[i] - series[i-1]
+        gains.append(max(ch, 0.0))
+        losses.append(-min(ch, 0.0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    rsis = [None]*period
+    for i in range(period+1, len(series)):
+        ch = series[i] - series[i-1]
+        gain = max(ch, 0.0)
+        loss = -min(ch, 0.0)
+        avg_gain = (avg_gain*(period-1) + gain) / period
+        avg_loss = (avg_loss*(period-1) + loss) / period
+        rs = math.inf if avg_loss == 0 else (avg_gain / avg_loss)
+        rsis.append(100 - (100/(1+rs)))
+    return rsis
+
+def format_usd(x):
+    if x >= 1: return f"${x:,.2f}"
+    return f"${x:.8f}".rstrip('0').rstrip('.')
+
+def percent_change(current, old):
+    if old == 0: return 0.0
+    return (current - old) / old * 100.0
+
+# -----------------------------
+# 4) Вход/Изход логика
+# -----------------------------
+def entry_exit_signal(closes):
+    """
+    BUY:  EMA20 > EMA50 и RSI(14) кръстосва нагоре 30.
+    SELL: RSI(14) кръстосва надолу 70 или close < EMA50.
+    """
+    if len(closes) < 80:
         return None
 
-def fetch_price(symbol: str) -> float | None:
-    if is_binance_symbol(symbol):
-        p = fetch_price_binance(symbol)
-        if p is not None: return p
-        cg = coingecko_id_for(symbol)
-        return fetch_price_coingecko_by_id(cg) if cg else None
-    cg = coingecko_id_for(symbol)
-    return fetch_price_coingecko_by_id(cg) if cg else None
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+    r = rsi(closes, 14)
 
-def host_from_link(link: str) -> str:
-    try:
-        return re.sub(r"^https?://", "", link).split("/")[0].lower()
-    except Exception:
-        return "source"
-
-def _contains_any(text: str, words: list[str]) -> bool:
-    return any(w in text for w in words)
-
-def classify_news_strict(title: str, summary: str, link: str) -> str | None:
-    host = host_from_link(link)
-    if host not in ALLOWED_SOURCES:
+    # защити за ръбове при RSI
+    if not r or len(r) < 2 or r[-1] is None or r[-2] is None:
         return None
 
-    text = f"{title} {summary}".lower()
+    c = closes[-1]
+    e20 = ema20[-1] if ema20 else None
+    e50 = ema50[-1] if ema50 else None
+    r_last = r[-1]
+    r_prev = r[-2]
 
-    # режем бюрократични/информационни постове
-    if _contains_any(text, BORING_TERMS):
-        return None
+    # BUY
+    if (e20 is not None) and (e50 is not None):
+        if e20 > e50 and r_prev < 30 <= r_last:
+            return f"🟢 Вход (RSI↑>30, EMA20>EMA50) | Цена: {format_usd(c)}"
 
-    # макро или големи актьори
-    strong_context = _contains_any(text, MAJORS) or _contains_any(text, MACRO)
+    # SELL
+    if r_prev > 70 >= r_last:
+        return f"🔴 Изход (RSI↓<70) | Цена: {format_usd(c)}"
+    if (e50 is not None) and c < e50:
+        return f"🔴 Изход (под EMA50) | Цена: {format_usd(c)}"
 
-    pos = _contains_any(text, STRONG_POS)
-    neg = _contains_any(text, STRONG_NEG)
-
-    if neg and strong_context: return "🔴"
-    if pos and strong_context: return "🟢"
     return None
 
-# ── Фонови цикли (без JobQueue) ──────────────────────────────────────────────
-async def prices_loop(app: Application):
-    cooldown = COOLDOWN_MINUTES * 60
-    await asyncio.sleep(2)
+# -----------------------------
+# 5) Цени – цикъл
+# -----------------------------
+def prices_loop():
     while True:
-        t0 = time.time()
-        for sym in SYMBOLS:
-            price = fetch_price(sym)
-            if price is None:
-                continue
-            dq = price_window.setdefault(sym, deque())
-            dq.append((t0, price))
-            while dq and (t0 - dq[0][0] > WINDOW_SECONDS):
-                dq.popleft()
-
-            if not dq or not ENABLE_RISE_ALERTS:
+        try:
+            ids = list(COINS.values())
+            if not ids:
+                time.sleep(PRICE_POLL_SEC)
                 continue
 
-            min_p = min(p for _, p in dq)
-            rise = pct_change(min_p, price)
-            if rise >= abs(current_rise_pct) and t0 - last_alert_up[sym] >= cooldown:
-                last_alert_up[sym] = t0
-                msg = (f"🔺 {sym}: {rise:.2f}% ръст ≤5 мин\n"
-                       f"От ~{min_p:.10g} до {price:.10g}")
+            data = cg_simple_price(ids)
+            ts = now_utc()
+
+            for sym, cid in COINS.items():
+                price = data.get(cid, {}).get("usd")
+                if price is None:
+                    logging.warning(f"[{sym}] няма цена от Coingecko")
+                    continue
+                price = float(price)
+                price_history[sym].append((ts, price))
+
+                # 5-мин сигнал
+                dq = price_history[sym]
+                old = None
+                for t0, p0 in dq:
+                    if ts - t0 >= timedelta(minutes=5):
+                        old = (t0, p0)  # най-близкото >=5м назад
+                if old:
+                    pct = percent_change(price, old[1])
+                    if abs(pct) >= PCT_5M_THRESHOLD:
+                        key = f"{sym}_pct5m_{'up' if pct>0 else 'down'}"
+                        if now_utc() - last_signal_at[key] > MIN_SIG_GAP:
+                            arrow = "🟢" if pct > 0 else "🔴"
+                            safe_send(OWNER_CHAT_ID, f"{arrow} {sym}: {pct:+.2f}% за 5 мин | Текущо: {format_usd(price)}")
+                            last_signal_at[key] = now_utc()
+
+                # Вход/Изход сигнал от минутни данни (посл. 1 ден)
                 try:
-                    await app.bot.send_message(CHAT_ID, msg)
-                except Exception:
-                    pass
+                    prices = cg_market_chart(cid, days="1", interval="minute")
+                    closes = [float(x[1]) for x in prices if isinstance(x, (list, tuple)) and len(x) >= 2]
+                    sig = entry_exit_signal(closes)
+                    if sig:
+                        key2 = f"{sym}_ee"
+                        if now_utc() - last_signal_at[key2] > MIN_SIG_GAP:
+                            safe_send(OWNER_CHAT_ID, f"{sym} | {sig}")
+                            last_signal_at[key2] = now_utc()
+                except Exception as e:
+                    logging.warning(f"EE calc fail {sym}: {e}")
 
-        elapsed = time.time() - t0
-        await asyncio.sleep(max(1, PRICE_POLL_SECONDS - int(elapsed)))
+        except Exception as e:
+            logging.error(f"prices_loop error: {e}")
 
-async def news_loop(app: Application):
-    # анти-спам при старт: маркирай последната статия от всеки фийд
-    for feed in FEEDS:
-        try:
-            d = feedparser.parse(feed)
-            if d.entries:
-                e0 = d.entries[0]
-                uid = getattr(e0,"id","") or getattr(e0,"guid","") or getattr(e0,"link","") or getattr(e0,"title","")
-                if uid: mark_seen(feed, uid)
-        except Exception:
-            pass
+        time.sleep(PRICE_POLL_SEC)
 
-    await asyncio.sleep(NEWS_POLL_INTERVAL)
+# -----------------------------
+# 6) Новини – цикъл (важни ключови думи)
+# -----------------------------
+NEWS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
+    "https://cointelegraph.com/rss",
+]
+NEWS_KEYWORDS = [
+    "SEC", "ETF", "hack", "exploit", "security breach", "listing",
+    "lawsuit", "ban", "regulation", "court", "Fed", "interest rate",
+    "Binance", "Coinbase", "BlackRock", "Grayscale", "ETF approval",
+    "liquidation", "outage", "fork", "halt",
+]
 
+def important_news(title: str) -> bool:
+    t = title.lower()
+    for k in NEWS_KEYWORDS:
+        if k.lower() in t:
+            return True
+    return False
+
+def news_loop():
     while True:
         try:
-            if get_pref("news_enabled","1") == "1":
-                for feed in FEEDS:
-                    try:
-                        d = feedparser.parse(feed)
-                    except Exception:
+            for feed in NEWS_FEEDS:
+                d = feedparser.parse(feed)
+                for e in d.entries[:10]:
+                    title = e.get("title", "")
+                    link = e.get("link", "")
+                    if not title or not link:
                         continue
-                    for e in reversed(d.entries[:10]):
-                        uid = getattr(e,"id","") or getattr(e,"guid","") or getattr(e,"link","") or getattr(e,"title","")
-                        if not uid or is_seen(feed, uid):
-                            continue
-                        title = getattr(e,"title","")
-                        summary = getattr(e,"summary","")
-                        link = getattr(e,"link","")
-                        tag = classify_news_strict(title, summary, link)
-                        if tag:
-                            msg = f"{tag} <b>{title}</b>\n🔗 <a href=\"{link}\">{host_from_link(link)}</a>"
-                            try:
-                                await app.bot.send_message(CHAT_ID, msg, parse_mode="HTML", disable_web_page_preview=True)
-                            except Exception:
-                                pass
-                        mark_seen(feed, uid)
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            pass
+                    key = (title.strip(), link.strip())
+                    if key in sent_news:
+                        continue
+                    if important_news(title):
+                        safe_send(OWNER_CHAT_ID, f"📰 Важна новина: {title}\n{link}")
+                        sent_news.append(key)
+        except Exception as e:
+            logging.error(f"news_loop error: {e}")
 
-        await asyncio.sleep(NEWS_POLL_INTERVAL)
+        time.sleep(NEWS_POLL_SEC)
 
-# ── Команди ──────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(
+# -----------------------------
+# 7) Telegram handlers
+# -----------------------------
+@bot.message_handler(commands=['start'])
+def start_cmd(msg):
+    if msg.chat.id != OWNER_CHAT_ID:
+        send_denied(msg.chat.id)
+        return
+    safe_send(msg.chat.id,
         "✅ Ботът е активен.\n"
-        "• Сигнали: САМО за РЪСТ (≤5 мин). Праг се сменя с /set_rise.\n"
-        "• Новини: само силни 🟢/🔴 събития (ETF, листинги/делистинги, хакове, спирания, CPI/FED).\n\n"
         "Команди:\n"
-        "/status – статус и символи\n"
-        "/set_rise 5 – смяна на прага (%)\n"
-        "/rise_on, /rise_off – вкл/изкл ръст сигналите\n"
-        "/set_symbols BTCUSDT,ETHUSDT,LEASH,BONE,TREAT,SNEK – смяна на списъка\n"
-        "/news_on, /news_off – вкл/изкл новините"
+        "/id – твоето chat_id\n"
+        "/price <COIN> – текуща цена (напр. /price LEASH)\n"
+        "/ping – тест\n"
+        f"5-мин сигнал: ±{PCT_5M_THRESHOLD}%\n"
+        "Сигнали Вход/Изход: RSI/EMA.\n"
+        "Новини: филтър по важни ключови думи."
     )
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    syms = ", ".join(SYMBOLS)
-    news = "ВКЛ" if get_pref("news_enabled","1") == "1" else "ИЗКЛ"
-    rise = "ВКЛ" if ENABLE_RISE_ALERTS else "ИЗКЛ"
-    await update.effective_chat.send_message(
-        f"📊 Символи: {syms}\n"
-        f"⏱ Прозорец: 5мин | Интервал: {PRICE_POLL_SECONDS}s | Ръст: {current_rise_pct:.1f}% [{rise}]\n"
-        f"📰 Новини: {news} | Интервал: {NEWS_POLL_INTERVAL}s"
-    )
+@bot.message_handler(commands=['id'])
+def id_cmd(msg):
+    if msg.chat.id != OWNER_CHAT_ID:
+        send_denied(msg.chat.id)
+        return
+    safe_send(msg.chat.id, f"chat_id: {msg.chat.id}")
 
-async def cmd_set_rise(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global current_rise_pct
+@bot.message_handler(commands=['ping'])
+def ping_cmd(msg):
+    if msg.chat.id != OWNER_CHAT_ID:
+        send_denied(msg.chat.id)
+        return
+    safe_send(msg.chat.id, "pong")
+
+@bot.message_handler(commands=['price'])
+def price_cmd(msg):
+    if msg.chat.id != OWNER_CHAT_ID:
+        send_denied(msg.chat.id)
+        return
+    parts = msg.text.strip().split()
+    if len(parts) < 2:
+        safe_send(msg.chat.id, "Използвай: /price COIN (напр. /price LEASH)")
+        return
+    sym = parts[1].upper()
+    cid = COINS.get(sym)
+    if not cid:
+        safe_send(msg.chat.id, f"Непозната монета: {sym}")
+        return
     try:
-        val = float(ctx.args[0])
-        if not (0.1 <= val <= 100):
-            raise ValueError
-        current_rise_pct = val
-        await update.effective_chat.send_message(f"✅ Прагът за ръст е {current_rise_pct:.2f}% (≤5 мин).")
-    except Exception:
-        await update.effective_chat.send_message("Използване: /set_rise 5  (число 0.1–100)")
+        data = cg_simple_price([cid])
+        px = float(data[cid]["usd"])
+        safe_send(msg.chat.id, f"{sym}: {format_usd(px)}")
+    except Exception as e:
+        safe_send(msg.chat.id, f"Грешка при цена за {sym}: {e}")
 
-async def cmd_rise_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global ENABLE_RISE_ALERTS
-    ENABLE_RISE_ALERTS = True
-    await update.effective_chat.send_message("✅ Алармите за ръст са ВКЛ.")
-
-async def cmd_rise_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global ENABLE_RISE_ALERTS
-    ENABLE_RISE_ALERTS = False
-    await update.effective_chat.send_message("🛑 Алармите за ръст са ИЗКЛ.")
-
-async def cmd_set_symbols(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global SYMBOLS, price_window
-    body = update.message.text.partition(" ")[2].strip().upper()
-    if not body:
-        await update.effective_chat.send_message("Използване: /set_symbols BTCUSDT,ETHUSDT,LEASH,BONE,TREAT,SNEK")
-        return
-    new_syms = [s.strip() for s in body.split(",") if s.strip()]
-    if not new_syms:
-        await update.effective_chat.send_message("Не са подадени валидни символи.")
-        return
-    SYMBOLS[:] = new_syms
-    for s in new_syms:
-        price_window.setdefault(s, deque())
-    await update.effective_chat.send_message("✅ Символите са обновени: " + ", ".join(SYMBOLS))
-
-async def cmd_news_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    set_pref("news_enabled", "1")
-    await update.effective_chat.send_message("✅ Новините са ВКЛ.")
-
-async def cmd_news_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    set_pref("news_enabled", "0")
-    await update.effective_chat.send_message("🛑 Новините са ИЗКЛ.")
-
-# ── Стартиране (без JobQueue) ────────────────────────────────────────────────
-async def _post_init(app: Application):
-    app.create_task(prices_loop(app))
-    app.create_task(news_loop(app))
-
-def main():
-    if not TOKEN or CHAT_ID == 0:
-        raise SystemExit("❌ Липсва TELEGRAM_BOT_TOKEN или OWNER_CHAT_ID в средата.")
-    init_db()
-    app = Application.builder().token(TOKEN).post_init(_post_init).build()
-    app.add_handler(CommandHandler("start",      cmd_start))
-    app.add_handler(CommandHandler("status",     cmd_status))
-    app.add_handler(CommandHandler("set_rise",   cmd_set_rise))
-    app.add_handler(CommandHandler("rise_on",    cmd_rise_on))
-    app.add_handler(CommandHandler("rise_off",   cmd_rise_off))
-    app.add_handler(CommandHandler("set_symbols",cmd_set_symbols))
-    app.add_handler(CommandHandler("news_on",    cmd_news_on))
-    app.add_handler(CommandHandler("news_off",   cmd_news_off))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+# -----------------------------
+# 8) Стартиране – паралелни цикли
+# -----------------------------
+def run_bot():
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=60)
+        except Exception as e:
+            logging.error(f"polling error: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    if not BOT_TOKEN or not OWNER_CHAT_ID:
+        raise SystemExit("Липсва TELEGRAM_BOT_TOKEN или OWNER_CHAT_ID в Environment!")
+    threading.Thread(target=prices_loop, daemon=True).start()
+    threading.Thread(target=news_loop, daemon=True).start()
+    logging.info("Ботът стартира (ценови и новинарски цикли активни).")
+    run_bot()
