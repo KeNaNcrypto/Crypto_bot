@@ -1,4 +1,4 @@
-# REQUIREMENTS (в requirements.txt):
+⁸# REQUIREMENTS (в requirements.txt):
 # pyTelegramBotAPI==4.17.0
 # requests==2.32.3
 # feedparser==6.0.11
@@ -254,7 +254,9 @@ def news_loop():
                     if key in sent_news:
                         continue
                     if important_news(title):
-                        safe_send(OWNER_CHAT_ID, f"📰 Важна новина: {title}\n{link}")
+                        dot = "🟢" if any(w in title.lower() for w in ["up","surge","gain","rally","расте","скок","поскъпва"]) \
+                              else ("🔴" if any(w in title.lower() for w in ["down","drop","fall","loss","спад","срив","поевтинява"]) else "⚪")
+                        safe_send(OWNER_CHAT_ID, f"{dot} {title}\n{link}")
                         sent_news.append(key)
         except Exception as e:
             logging.error(f"news_loop error: {e}")
