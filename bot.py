@@ -1,4 +1,4 @@
-⁸# REQUIREMENTS (в requirements.txt):
+# REQUIREMENTS (в requirements.txt):
 # pyTelegramBotAPI==4.17.0
 # requests==2.32.3
 # feedparser==6.0.11
